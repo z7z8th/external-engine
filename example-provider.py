@@ -27,9 +27,11 @@ _LOG_LEVEL_MAP = {
 
 def ok(res):
     try:
+        print('Got HTTP res', res, res.text)
         res.raise_for_status()
-    except requests.exceptions.HTTPError:
-        logging.error("Response: %s", res.text)
+    except requests.exceptions.HTTPError as e:
+        logging.exception('Got HTTP Error %s', res.text)
+        # logging.error("Response: %s", res.text)
         raise
     return res
 
@@ -57,6 +59,7 @@ def register_engine(args, http, engine):
         "variants": [variant for variant in engine.supported_variants or ["chess"] if variant in variants],
         "providerSecret": secret,
     }
+    logging.debug('registration %s', registration)
 
     for engine in res.json():
         if engine["name"] == args.name:
@@ -146,6 +149,7 @@ class Engine:
         self.uci()
         self.setoption("UCI_AnalyseMode", "true")
         self.setoption("UCI_Chess960", "true")
+        self.setoption("UCI_ShowWDL", "false")
         for name, value in args.setoption:
             self.setoption(name, value)
 
@@ -157,7 +161,7 @@ class Engine:
         self.alive = False
 
     def send(self, command):
-        logging.debug("%d << %s", self.process.pid, command)
+        logging.debug("%d <cmd> %s", self.process.pid, command)
         self.process.stdin.write(command + "\n")
         self.process.stdin.flush()
 
@@ -166,13 +170,13 @@ class Engine:
             line = self.process.stdout.readline()
             if line == "":
                 self.alive = False
-                raise EOFError()
+                raise EOFError("Empty line received, abort!")
 
             line = line.rstrip()
             if not line:
                 continue
 
-            logging.debug("%d >> %s", self.process.pid, line)
+            logging.debug("%d <resp> %s", self.process.pid, line)
 
             command_and_params = line.split(None, 1)
 
@@ -286,7 +290,7 @@ if __name__ == "__main__":
     parser.add_argument("--provider-secret", default=os.environ.get("PROVIDER_SECRET"), help="Optional fixed provider secret")
     parser.add_argument("--max-threads", type=int, default=multiprocessing.cpu_count(), help="Maximum number of available threads")
     parser.add_argument("--max-hash", type=int, default=512, help="Maximum hash table size in MiB")
-    parser.add_argument("--keep-alive", type=int, default=300, help="Number of seconds to keep an idle/unused engine process around")
+    parser.add_argument("--keep-alive", type=int, default=10, help="Number of seconds to keep an idle/unused engine process around")
     parser.add_argument("--log-level", default="info", choices=_LOG_LEVEL_MAP.keys(), help="Logging verbosity")
 
     try:
@@ -298,7 +302,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    logging.basicConfig(level=_LOG_LEVEL_MAP[args.log_level])
+    logging.basicConfig(level=_LOG_LEVEL_MAP[args.log_level],
+                        format='%(asctime)s,%(msecs)03d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',datefmt='%Y-%m-%dT%H:%M:%S')
 
     if not args.token:
         print(f"Need LICHESS_API_TOKEN environment variable from {args.lichess}/account/oauth/token/create?scopes[]=engine:read&scopes[]=engine:write")
