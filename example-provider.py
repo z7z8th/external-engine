@@ -98,8 +98,12 @@ def main(args):
                     logging.info("Terminating idle engine")
                     engine.terminate()
                 continue
+            if res.status_code == 204:  # No Content
+                logging.debug('No work yet.')
+                continue
             job = res.json()
         except requests.exceptions.RequestException as err:
+            # if len(res.text):
             logging.error("Error while trying to acquire work: %s", err)
             backoff = min(backoff * 1.5, 10)
             time.sleep(backoff)
