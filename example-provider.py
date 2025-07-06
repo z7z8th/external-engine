@@ -14,6 +14,11 @@ import subprocess
 import sys
 import time
 import threading
+import psutil
+
+TOTAL_MEM_MiB = int(psutil.virtual_memory().total / 1024 / 1024)
+MAX_THREADS = multiprocessing.cpu_count()  # int(multiprocessing.cpu_count()/2)
+MAX_HASH = int(TOTAL_MEM_MiB/2)
 
 _LOG_LEVEL_MAP = {
         "critical": logging.CRITICAL,
@@ -27,7 +32,7 @@ _LOG_LEVEL_MAP = {
 
 def ok(res):
     try:
-        print('Got HTTP res', res, res.text)
+        print('Got HTTP res', res, 'res.text', res.text)
         res.raise_for_status()
     except requests.exceptions.HTTPError as e:
         logging.exception('Got HTTP Error %s', res.text)
@@ -55,7 +60,8 @@ def register_engine(args, http, engine):
     registration = {
         "name": args.name,
         "maxThreads": args.max_threads,
-        "maxHash": args.max_hash,
+        # lila's maxHash is limited to 512, but local engine can use more
+        "maxHash": 512, # args.max_hash
         "variants": [variant for variant in engine.supported_variants or ["chess"] if variant in variants],
         "providerSecret": secret,
     }
@@ -87,7 +93,7 @@ def main(args):
     while True:
         try:
             res = ok(http.post(f"{args.broker}/api/external-engine/work", json={"providerSecret": secret}, timeout=12))
-            if res.status_code != 200:
+            if res.status_code < 200 or res.status_code >= 300:
                 if engine.alive and engine.idle_time() > args.keep_alive:
                     logging.info("Terminating idle engine")
                     engine.terminate()
@@ -150,6 +156,8 @@ class Engine:
         self.setoption("UCI_AnalyseMode", "true")
         self.setoption("UCI_Chess960", "true")
         self.setoption("UCI_ShowWDL", "false")
+        self.setoption("Hash", args.max_hash)
+        self.setoption("Threads", args.max_threads)
         for name, value in args.setoption:
             self.setoption(name, value)
 
@@ -228,10 +236,10 @@ class Engine:
             self.setoption("Threads", work["threads"])
             self.threads = work["threads"]
             options_changed = True
-        if self.hash != work["hash"]:
-            self.setoption("Hash", work["hash"])
-            self.hash = work["hash"]
-            options_changed = True
+        # if self.hash != work["hash"]:
+        #     self.setoption("Hash", work["hash"])
+        #     self.hash = work["hash"]
+        #     options_changed = True
         if self.multi_pv != work["multiPv"]:
             self.setoption("MultiPV", work["multiPv"])
             self.multi_pv = work["multiPv"]
@@ -288,9 +296,9 @@ if __name__ == "__main__":
     parser.add_argument("--broker", default="https://engine.lichess.ovh", help="Defaults to https://engine.lichess.ovh")
     parser.add_argument("--token", default=os.environ.get("LICHESS_API_TOKEN"), help="API token with engine:read and engine:write scopes")
     parser.add_argument("--provider-secret", default=os.environ.get("PROVIDER_SECRET"), help="Optional fixed provider secret")
-    parser.add_argument("--max-threads", type=int, default=multiprocessing.cpu_count(), help="Maximum number of available threads")
-    parser.add_argument("--max-hash", type=int, default=512, help="Maximum hash table size in MiB")
-    parser.add_argument("--keep-alive", type=int, default=10, help="Number of seconds to keep an idle/unused engine process around")
+    parser.add_argument("--max-threads", type=int, default=MAX_THREADS, help="Maximum number of available threads")
+    parser.add_argument("--max-hash", type=int, default=MAX_HASH, help="Maximum hash table size in MiB")
+    parser.add_argument("--keep-alive", type=int, default=3600, help="Number of seconds to keep an idle/unused engine process around")
     parser.add_argument("--log-level", default="info", choices=_LOG_LEVEL_MAP.keys(), help="Logging verbosity")
 
     try:
@@ -304,6 +312,9 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=_LOG_LEVEL_MAP[args.log_level],
                         format='%(asctime)s,%(msecs)03d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',datefmt='%Y-%m-%dT%H:%M:%S')
+
+    logging.debug(args)
+    logging.info('total mem %d MiB (%d GiB)', TOTAL_MEM_MiB, TOTAL_MEM_MiB/1024)
 
     if not args.token:
         print(f"Need LICHESS_API_TOKEN environment variable from {args.lichess}/account/oauth/token/create?scopes[]=engine:read&scopes[]=engine:write")
