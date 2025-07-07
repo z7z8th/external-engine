@@ -29,6 +29,30 @@ _LOG_LEVEL_MAP = {
         "notset": logging.NOTSET,
         }
 
+class CustomFormatter(logging.Formatter):
+
+    grey = "\x1b[38;20m"
+    green = "\x1b[32;20m"
+    yellow = "\x1b[33;20m"
+    red = "\x1b[31;20m"
+    bold_red = "\x1b[31;1m"
+    reset = "\x1b[0m"
+    # %(name)s
+    format = "%(asctime)s %(levelname)s %(message)s (%(filename)s:%(lineno)d)"
+
+    FORMATS = {
+        logging.DEBUG: grey + format + reset,
+        logging.INFO: green + format + reset,
+        logging.WARNING: yellow + format + reset,
+        logging.ERROR: red + format + reset,
+        logging.CRITICAL: bold_red + format + reset
+    }
+
+    def format(self, record):
+        log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt)
+        return formatter.format(record)
+
 
 def ok(res):
     try:
@@ -58,7 +82,7 @@ def register_engine(args, http, engine):
     }
 
     registration = {
-        "name": args.name,
+        "name": args.name or engine.name,
         "maxThreads": args.max_threads,
         # lila's maxHash is limited to 512, but local engine can use more
         "maxHash": 512, # args.max_hash
@@ -212,6 +236,10 @@ class Engine:
                         self.supported_variants.append(args.pop(0))
             elif command == "uciok":
                 break
+            elif command == "id":
+                k, v = args.split(None, 1)
+                if k == "name":  # engine name from uci
+                    self.name = "[L] " + v
 
         if self.supported_variants:
             logging.info("Supported variants: %s", ", ".join(self.supported_variants))
@@ -293,8 +321,9 @@ class Engine:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, fromfile_prefix_chars='@')
-    parser.add_argument("--name", default="Alpha 2", help="Engine name to register")
-    parser.add_argument("--engine", help="Shell command to launch UCI engine", required=True)
+    parser.add_argument("--name", help="Engine name to register")
+    parser.add_argument("--engine", help="Shell command to launch UCI engine", required=False)
+    parser.add_argument("--config", help="Configs of UCI engines", required=False)
     parser.add_argument("--setoption", nargs=2, action="append", default=[], metavar=("NAME", "VALUE"), help="Set a custom UCI option")
     parser.add_argument("--lichess", default="https://lichess.org", help="Defaults to https://lichess.org")
     parser.add_argument("--broker", default="https://engine.lichess.ovh", help="Defaults to https://engine.lichess.ovh")
@@ -302,7 +331,7 @@ if __name__ == "__main__":
     parser.add_argument("--provider-secret", default=os.environ.get("PROVIDER_SECRET"), help="Optional fixed provider secret")
     parser.add_argument("--max-threads", type=int, default=MAX_THREADS, help="Maximum number of available threads")
     parser.add_argument("--max-hash", type=int, default=MAX_HASH, help="Maximum hash table size in MiB")
-    parser.add_argument("--keep-alive", type=int, default=3600, help="Number of seconds to keep an idle/unused engine process around")
+    parser.add_argument("--keep-alive", type=int, default=1800, help="Number of seconds to keep an idle/unused engine process around")
     parser.add_argument("--log-level", default="info", choices=_LOG_LEVEL_MAP.keys(), help="Logging verbosity")
 
     try:
@@ -314,11 +343,21 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    logging.basicConfig(level=_LOG_LEVEL_MAP[args.log_level],
-                        format='%(asctime)s,%(msecs)03d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',datefmt='%Y-%m-%dT%H:%M:%S')
+    # logging.basicConfig(level=_LOG_LEVEL_MAP[args.log_level],
+    #                     format='%(asctime)s,%(msecs)03d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',datefmt='%Y-%m-%dT%H:%M:%S')
+    rootLogger = logging.getLogger()
+    rootLogger.setLevel(_LOG_LEVEL_MAP[args.log_level])
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    ch.setFormatter(CustomFormatter())
+    rootLogger.addHandler(ch)
 
     logging.debug(args)
-    logging.info('total mem %d MiB (%d GiB)', TOTAL_MEM_MiB, TOTAL_MEM_MiB/1024)
+    logging.info('Total Mem %d MiB (%d GiB)', TOTAL_MEM_MiB, TOTAL_MEM_MiB/1024)
+
+    if not args.engine and not args.config:
+        print(f"One of --engine and --config must be specified.")
+        sys.exit(128)
 
     if not args.token:
         print(f"Need LICHESS_API_TOKEN environment variable from {args.lichess}/account/oauth/token/create?scopes[]=engine:read&scopes[]=engine:write")
