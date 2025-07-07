@@ -13,6 +13,8 @@ import secrets
 import subprocess
 import sys
 import time
+import json
+from types import SimpleNamespace
 import threading
 import psutil
 
@@ -65,111 +67,157 @@ def ok(res):
     return res
 
 
-def register_engine(args, http, engine):
-    res = ok(http.get(f"{args.lichess}/api/external-engine"))
+class XtEngProvider:
+    def __init__(self, args, eng_cfg):
+        self.args = args
+        self.eng_cfg = eng_cfg
+        self.engine = Engine(eng_cfg)
+        self.name = hasattr(eng_cfg, 'name') and eng_cfg.name or self.engine.name
+        self.http = requests.Session()
+        self.http.headers["Authorization"] = f"Bearer {args.token}"
+        self.secret = self.register_engine(args, self.http, self.engine)
 
-    secret = args.provider_secret or secrets.token_urlsafe(32)
+    def register_engine(self, args, http, engine):
+        res = ok(http.get(f"{args.lichess}/api/external-engine"))
 
-    variants = {
-        "chess",
-        "antichess",
-        "atomic",
-        "crazyhouse",
-        "horde",
-        "kingofthehill",
-        "racingkings",
-        "3check",
-    }
+        secret = hasattr(self.eng_cfg, 'provider_secret') and self.eng_cfg.provider_secret or secrets.token_urlsafe(32)
 
-    registration = {
-        "name": args.name or engine.name,
-        "maxThreads": args.max_threads,
-        # lila's maxHash is limited to 512, but local engine can use more
-        "maxHash": 512, # args.max_hash
-        "variants": [variant for variant in engine.supported_variants or ["chess"] if variant in variants],
-        "providerSecret": secret,
-    }
-    logging.debug('registration %s', registration)
+        variants = {
+            "chess",
+            "antichess",
+            "atomic",
+            "crazyhouse",
+            "horde",
+            "kingofthehill",
+            "racingkings",
+            "3check",
+        }
 
-    for engine in res.json():
-        if engine["name"] == args.name:
-            logging.info("Updating engine %s", engine["id"])
-            ok(http.put(f"{args.lichess}/api/external-engine/{engine['id']}", json=registration))
-            break
-    else:
-        logging.info("Registering new engine")
-        ok(http.post(f"{args.lichess}/api/external-engine", json=registration))
+        registration = {
+            "name": self.name,
+            "maxThreads": args.max_threads,
+            # lila's maxHash is limited to 512, but local engine can use more
+            "maxHash": 512, # args.max_hash
+            "variants": [variant for variant in engine.supported_variants or ["chess"] if variant in variants],
+            "providerSecret": secret,
+        }
+        logging.debug('registration %s', registration)
 
-    return secret
+        for engine in res.json():
+            if engine["name"] == self.name:
+                logging.info("Updating engine %s", engine["id"])
+                ok(http.put(f"{args.lichess}/api/external-engine/{engine['id']}", json=registration))
+                break
+        else:
+            logging.info("Registering new engine")
+            ok(http.post(f"{args.lichess}/api/external-engine", json=registration))
+
+        return secret
+
+    def proc_work(self):
+        logging.info('processing work %s', self.name)
+        args = self.args
+        backoff = 1
+        while True:
+            try:
+                res = ok(self.http.post(f"{args.broker}/api/external-engine/work", json={"providerSecret": self.secret}, timeout=12))
+                if res.status_code < 200 or res.status_code >= 300:
+                    if self.engine.alive and self.engine.idle_time() > args.keep_alive:
+                        logging.info("Terminating idle engine %s", self.name)
+                        self.engine.terminate()
+                    continue
+                if res.status_code == 204:  # No Content
+                    logging.debug('No work yet. %s', self.name)
+                    continue
+                job = res.json()
+            except requests.exceptions.RequestException as err:
+                # if len(res.text):
+                logging.error("Error while trying to acquire work: %s(%s)", err, self.name)
+                backoff = min(backoff * 1.5, 10)
+                time.sleep(backoff)
+                continue
+            else:
+                backoff = 1
+
+            try:
+                self.engine.stop()
+            except EOFError:
+                pass
+            # last_future.result()
+
+            if not self.engine.alive:
+                self.engine = Engine(self.eng_cfg)
+
+            job_started = threading.Event()
+            # last_future = executor.submit(handle_job, args, engine, job, job_started)
+            # job_started.wait()
+            self.handle_job(args, self.engine, job, job_started)
+
+
+    def handle_job(self, args, engine, job, job_started):
+        try:
+            logging.info("Handling job %s", job["id"])
+            with engine.analyse(job, job_started) as analysis_stream:
+                ok(requests.post(f"{args.broker}/api/external-engine/work/{job['id']}", data=analysis_stream))
+        except requests.exceptions.ConnectionError:
+            logging.info("Connection closed while streaming analysis")
+        except requests.exceptions.RequestException as err:
+            logging.exception("Error while submitting work")
+            time.sleep(5)
+        except EOFError:
+            logging.exception("Engine died")
+            time.sleep(5)
+        finally:
+            job_started.set()
+            return
 
 
 def main(args):
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    engine = Engine(args)
-    http = requests.Session()
-    http.headers["Authorization"] = f"Bearer {args.token}"
-    secret = register_engine(args, http, engine)
+    max_workers = 0
+    if args.engine:
+        max_workers = 1
+    if args.config:
+        max_workers = len(args.config.engines)
 
-    last_future = concurrent.futures.Future()
-    last_future.set_result(None)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    providers = {}
+    if args.engine:
+        p = XtEngProvider(args, args)
+        providers[p.name] = p
 
-    backoff = 1
+    if args.config:
+        for cfg in args.config.engines:
+            p = XtEngProvider(args, cfg)
+            providers[p.name] = p
+
+    # last_future = concurrent.futures.Future()
+    # last_future.set_result(None)
+    logging.info('providers %s', providers)
+    futures = {}
+    pcnt = 0
+    for pname, p in providers.items():
+        pcnt += 1
+        futures[pname] = executor.submit(p.proc_work)
     while True:
-        try:
-            res = ok(http.post(f"{args.broker}/api/external-engine/work", json={"providerSecret": secret}, timeout=12))
-            if res.status_code < 200 or res.status_code >= 300:
-                if engine.alive and engine.idle_time() > args.keep_alive:
-                    logging.info("Terminating idle engine")
-                    engine.terminate()
-                continue
-            if res.status_code == 204:  # No Content
-                logging.debug('No work yet.')
-                continue
-            job = res.json()
-        except requests.exceptions.RequestException as err:
-            # if len(res.text):
-            logging.error("Error while trying to acquire work: %s", err)
-            backoff = min(backoff * 1.5, 10)
-            time.sleep(backoff)
-            continue
-        else:
-            backoff = 1
+        dcnt = 0
+        futures_left = {}
+        for fname, f in futures.items():
+            try:
+                logging.debug("provider %s done: %s", fname, f.result(5))
+                dcnt +=1
+            except TimeoutError:
+                futures_left[fname] = f
+                pass
+        if len(futures_left.items()) == 0:
+            break
+        futures = futures_left
 
-        try:
-            engine.stop()
-        except EOFError:
-            pass
-        last_future.result()
-
-        if not engine.alive:
-            engine = Engine(args)
-
-        job_started = threading.Event()
-        last_future = executor.submit(handle_job, args, engine, job, job_started)
-        job_started.wait()
-
-
-def handle_job(args, engine, job, job_started):
-    try:
-        logging.info("Handling job %s", job["id"])
-        with engine.analyse(job, job_started) as analysis_stream:
-            ok(requests.post(f"{args.broker}/api/external-engine/work/{job['id']}", data=analysis_stream))
-    except requests.exceptions.ConnectionError:
-        logging.info("Connection closed while streaming analysis")
-    except requests.exceptions.RequestException as err:
-        logging.exception("Error while submitting work")
-        time.sleep(5)
-    except EOFError:
-        logging.exception("Engine died")
-        time.sleep(5)
-    finally:
-        job_started.set()
 
 
 class Engine:
-    def __init__(self, args):
-        self.process = subprocess.Popen(args.engine, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=1, universal_newlines=True)
-        self.args = args
+    def __init__(self, cfg):
+        self.process = subprocess.Popen(cfg.engine, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=1, universal_newlines=True)
+        self.cfg = cfg
         self.session_id = None
         self.hash = None
         self.threads = None
@@ -184,10 +232,13 @@ class Engine:
         self.setoption("UCI_AnalyseMode", "true")
         self.setoption("UCI_Chess960", "true")
         self.setoption("UCI_ShowWDL", "false")
-        self.setoption("Hash", args.max_hash)
-        self.setoption("Threads", args.max_threads)
-        for name, value in args.setoption:
-            self.setoption(name, value)
+        if hasattr(cfg, 'max_hash'):
+            self.setoption("Hash", cfg.max_hash)
+        if hasattr(cfg, 'max_threads'):
+            self.setoption("Threads", cfg.max_threads)
+        if hasattr(cfg, 'setoption'):
+            for name, value in cfg.setoption:
+                self.setoption(name, value)
 
     def idle_time(self):
         return time.monotonic() - self.last_used
@@ -212,7 +263,10 @@ class Engine:
             if not line:
                 continue
 
-            logging.debug("%d <resp> %s", self.process.pid, line)
+            if 'bestmove' in line:
+                logging.info("%d <resp> %s", self.process.pid, line)
+            else:
+                logging.debug("%d <resp> %s", self.process.pid, line)
 
             command_and_params = line.split(None, 1)
 
@@ -323,6 +377,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, fromfile_prefix_chars='@')
     parser.add_argument("--name", help="Engine name to register")
     parser.add_argument("--engine", help="Shell command to launch UCI engine", required=False)
+    # parser.add_argument("--config", default=os.path.join(os.path.dirname(os.path.realpath(__file__)), 'config.json'), help="Configs of UCI engines", required=False)
     parser.add_argument("--config", help="Configs of UCI engines", required=False)
     parser.add_argument("--setoption", nargs=2, action="append", default=[], metavar=("NAME", "VALUE"), help="Set a custom UCI option")
     parser.add_argument("--lichess", default="https://lichess.org", help="Defaults to https://lichess.org")
@@ -332,7 +387,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-threads", type=int, default=MAX_THREADS, help="Maximum number of available threads")
     parser.add_argument("--max-hash", type=int, default=MAX_HASH, help="Maximum hash table size in MiB")
     parser.add_argument("--keep-alive", type=int, default=1800, help="Number of seconds to keep an idle/unused engine process around")
-    parser.add_argument("--log-level", default="info", choices=_LOG_LEVEL_MAP.keys(), help="Logging verbosity")
+    parser.add_argument("--log-level", default="debug", choices=_LOG_LEVEL_MAP.keys(), help="Logging verbosity")
 
     try:
         import argcomplete
@@ -358,6 +413,10 @@ if __name__ == "__main__":
     if not args.engine and not args.config:
         print(f"One of --engine and --config must be specified.")
         sys.exit(128)
+
+    if args.config:
+        with open(args.config) as f:
+            args.config = json.load(f, object_hook=lambda d: SimpleNamespace(**d))
 
     if not args.token:
         print(f"Need LICHESS_API_TOKEN environment variable from {args.lichess}/account/oauth/token/create?scopes[]=engine:read&scopes[]=engine:write")
