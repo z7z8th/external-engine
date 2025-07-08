@@ -68,11 +68,13 @@ def ok(res):
 
 
 class XtEngProvider:
-    def __init__(self, args, eng_cfg):
+    def __init__(self, args, eng_cfg, executor):
         self.args = args
         self.eng_cfg = eng_cfg
+        self.executor = executor
         self.engine = Engine(eng_cfg)
         self.name = hasattr(eng_cfg, 'name') and eng_cfg.name or self.engine.name
+        self.keep_alive = hasattr(eng_cfg, 'keep_alive') and eng_cfg.keep_alive or args.keep_alive
         self.http = requests.Session()
         self.http.headers["Authorization"] = f"Bearer {args.token}"
         self.secret = self.register_engine(args, self.http, self.engine)
@@ -109,7 +111,7 @@ class XtEngProvider:
                 ok(http.put(f"{args.lichess}/api/external-engine/{engine['id']}", json=registration))
                 break
         else:
-            logging.info("Registering new engine")
+            logging.info("Registering new engine %s", self.name)
             ok(http.post(f"{args.lichess}/api/external-engine", json=registration))
 
         return secret
@@ -118,21 +120,21 @@ class XtEngProvider:
         logging.info('processing work %s', self.name)
         args = self.args
         backoff = 1
+        last_future = None
         while True:
             try:
                 res = ok(self.http.post(f"{args.broker}/api/external-engine/work", json={"providerSecret": self.secret}, timeout=12))
-                if res.status_code < 200 or res.status_code >= 300:
-                    if self.engine.alive and self.engine.idle_time() > args.keep_alive:
-                        logging.info("Terminating idle engine %s", self.name)
-                        self.engine.terminate()
-                    continue
                 if res.status_code == 204:  # No Content
                     logging.debug('No work yet. %s', self.name)
+                if res.status_code != 200:
+                    if self.engine.alive and self.engine.idle_time() > self.keep_alive:
+                        logging.info("Terminating idle engine %s", self.name)
+                        self.engine.terminate()
                     continue
                 job = res.json()
             except requests.exceptions.RequestException as err:
                 # if len(res.text):
-                logging.error("Error while trying to acquire work: %s(%s)", err, self.name)
+                logging.error("Error while trying to acquire work: %s (%s)", err, self.name)
                 backoff = min(backoff * 1.5, 10)
                 time.sleep(backoff)
                 continue
@@ -143,33 +145,34 @@ class XtEngProvider:
                 self.engine.stop()
             except EOFError:
                 pass
-            # last_future.result()
+
+            if last_future:
+                logging.debug('Waiting for last job done (%s)', self.name)
+                last_future.result()  # waiting for last handle_job done, i.e. posted result to server
 
             if not self.engine.alive:
                 self.engine = Engine(self.eng_cfg)
 
             job_started = threading.Event()
-            # last_future = executor.submit(handle_job, args, engine, job, job_started)
-            # job_started.wait()
-            self.handle_job(args, self.engine, job, job_started)
+            last_future = self.executor.submit(self.handle_job, args, self.engine, job, job_started)
+            job_started.wait()
 
 
     def handle_job(self, args, engine, job, job_started):
         try:
-            logging.info("Handling job %s", job["id"])
+            logging.info("Handling job %s (%s)", job["id"], self.name)
             with engine.analyse(job, job_started) as analysis_stream:
                 ok(requests.post(f"{args.broker}/api/external-engine/work/{job['id']}", data=analysis_stream))
         except requests.exceptions.ConnectionError:
-            logging.info("Connection closed while streaming analysis")
+            logging.info("Connection closed while streaming analysis (%s)", self.name)
         except requests.exceptions.RequestException as err:
-            logging.exception("Error while submitting work")
+            logging.exception("Error while submitting work (%s)", self.name)
             time.sleep(5)
         except EOFError:
-            logging.exception("Engine died")
+            logging.exception("Engine died (%s)", self.name)
             time.sleep(5)
         finally:
             job_started.set()
-            return
 
 
 def main(args):
@@ -179,19 +182,17 @@ def main(args):
     if args.config:
         max_workers = len(args.config.engines)
 
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers*2)
     providers = {}
     if args.engine:
-        p = XtEngProvider(args, args)
+        p = XtEngProvider(args, args, executor)
         providers[p.name] = p
 
     if args.config:
         for cfg in args.config.engines:
-            p = XtEngProvider(args, cfg)
+            p = XtEngProvider(args, cfg, executor)
             providers[p.name] = p
 
-    # last_future = concurrent.futures.Future()
-    # last_future.set_result(None)
     logging.info('providers %s', providers)
     futures = {}
     pcnt = 0
@@ -213,10 +214,24 @@ def main(args):
         futures = futures_left
 
 
+def kill_process_and_children(pid: int, sig: int = 15):
+    try:
+        proc = psutil.Process(pid)
+    except psutil.NoSuchProcess as e:
+        logging.warning('No such process %d', pid)
+        return
+
+    for child_process in proc.children(recursive=True):
+        child_process.send_signal(sig)
+
+    proc.send_signal(sig)
+
 
 class Engine:
     def __init__(self, cfg):
+        logging.info('Starting engine %s', cfg.engine)
         self.process = subprocess.Popen(cfg.engine, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=1, universal_newlines=True)
+        self.name = None
         self.cfg = cfg
         self.session_id = None
         self.hash = None
@@ -237,23 +252,32 @@ class Engine:
         if hasattr(cfg, 'max_threads'):
             self.setoption("Threads", cfg.max_threads)
         if hasattr(cfg, 'setoption'):
-            for name, value in cfg.setoption:
+            if  isinstance(cfg.setoption, list):
+                options = cfg.setoption
+            else:
+                options = vars(cfg.setoption).items()
+            for name, value in options:
                 self.setoption(name, value)
+        logging.info('Engine %s started', cfg.engine)
 
     def idle_time(self):
         return time.monotonic() - self.last_used
 
     def terminate(self):
-        self.process.terminate()
+        # self.process.terminate()  # only terminates invoking shell
+        kill_process_and_children(self.process.pid)  # Popen Shell=True, need to kill child process manully
+        self.process.wait()
         self.alive = False
 
     def send(self, command):
-        logging.debug("%d <cmd> %s", self.process.pid, command)
+        self.last_used = time.monotonic()
+        logging.info("%d <cmd> %s (%s)", self.process.pid, command, self.name)
         self.process.stdin.write(command + "\n")
         self.process.stdin.flush()
 
     def recv(self):
         while True:
+            self.last_used = time.monotonic()
             line = self.process.stdout.readline()
             if line == "":
                 self.alive = False
@@ -264,9 +288,9 @@ class Engine:
                 continue
 
             if 'bestmove' in line:
-                logging.info("%d <resp> %s", self.process.pid, line)
+                logging.info("%d <resp> %s (%s)", self.process.pid, line, self.name)
             else:
-                logging.debug("%d <resp> %s", self.process.pid, line)
+                logging.debug("%d <resp> %s (%s)", self.process.pid, line, self.name)
 
             command_and_params = line.split(None, 1)
 
@@ -306,6 +330,10 @@ class Engine:
                 break
 
     def setoption(self, name, value):
+        if value is False:
+            value = "false"
+        elif value is True:
+            value = "true"
         self.send(f"setoption name {name} value {value}")
 
     @contextlib.contextmanager
@@ -322,6 +350,7 @@ class Engine:
             self.setoption("Threads", work["threads"])
             self.threads = work["threads"]
             options_changed = True
+        # Lichess configurable Hash size 512 is too small
         # if self.hash != work["hash"]:
         #     self.setoption("Hash", work["hash"])
         #     self.hash = work["hash"]
@@ -344,7 +373,7 @@ class Engine:
                 self.send(f"go {key} {work[key]}")
                 break
 
-        job_started.set()
+        job_started.set()  # Signal self.proc_work to fetch next work
 
         def stream():
             while True:
