@@ -19,8 +19,12 @@ import threading
 import psutil
 
 TOTAL_MEM_MiB = int(psutil.virtual_memory().total / 1024 / 1024)
-MAX_THREADS = multiprocessing.cpu_count()  # int(multiprocessing.cpu_count()/2)
 MAX_HASH = int(TOTAL_MEM_MiB/2)
+MAX_THREADS = multiprocessing.cpu_count()  # int(multiprocessing.cpu_count()/2)
+
+DEFAULT_HASH = int(TOTAL_MEM_MiB/4)
+DEFAULT_THREADS = int(MAX_THREADS/2)
+DEFAULT_KEEP_ALIVE = 5*60
 
 _LOG_LEVEL_MAP = {
         "critical": logging.CRITICAL,
@@ -97,7 +101,7 @@ class XtEngProvider:
 
         registration = {
             "name": self.name,
-            "maxThreads": args.max_threads,
+            "maxThreads": hasattr(self.eng_cfg, "max_threads") and self.eng_cfg.max_threads or args.max_threads,
             # lila's maxHash is limited to 512, but local engine can use more
             "maxHash": 512, # args.max_hash
             "variants": [variant for variant in engine.supported_variants or ["chess"] if variant in variants],
@@ -247,10 +251,15 @@ class Engine:
         self.setoption("UCI_AnalyseMode", "true")
         self.setoption("UCI_Chess960", "true")
         self.setoption("UCI_ShowWDL", "false")
-        if hasattr(cfg, 'max_hash'):
-            self.setoption("Hash", cfg.max_hash)
-        if hasattr(cfg, 'max_threads'):
-            self.setoption("Threads", cfg.max_threads)
+        if hasattr(cfg, 'hash'):
+            self.setoption("Hash", cfg.hash)
+        else:
+            self.setoption("Hash", DEFAULT_HASH)
+        if hasattr(cfg, 'threads'):
+            self.setoption("Threads", cfg.threads)
+        else:
+            self.setoption("Threads", DEFAULT_THREADS)
+
         if hasattr(cfg, 'setoption'):
             if  isinstance(cfg.setoption, list):
                 options = cfg.setoption
@@ -415,7 +424,7 @@ if __name__ == "__main__":
     parser.add_argument("--provider-secret", default=os.environ.get("PROVIDER_SECRET"), help="Optional fixed provider secret")
     parser.add_argument("--max-threads", type=int, default=MAX_THREADS, help="Maximum number of available threads")
     parser.add_argument("--max-hash", type=int, default=MAX_HASH, help="Maximum hash table size in MiB")
-    parser.add_argument("--keep-alive", type=int, default=1800, help="Number of seconds to keep an idle/unused engine process around")
+    parser.add_argument("--keep-alive", type=int, default=DEFAULT_KEEP_ALIVE, help="Number of seconds to keep an idle/unused engine process around")
     parser.add_argument("--log-level", default="debug", choices=_LOG_LEVEL_MAP.keys(), help="Logging verbosity")
 
     try:
