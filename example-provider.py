@@ -9,6 +9,7 @@ import logging
 import multiprocessing
 import os
 import requests
+from requests.adapters import HTTPAdapter, Retry
 import secrets
 import subprocess
 import sys
@@ -20,6 +21,7 @@ import psutil
 
 TOTAL_MEM_MiB = int(psutil.virtual_memory().total / 1024 / 1024)
 MAX_HASH = int(TOTAL_MEM_MiB/2)
+MAX_HASH_GB = int(MAX_HASH/1024)
 MAX_THREADS = multiprocessing.cpu_count()  # int(multiprocessing.cpu_count()/2)
 
 DEFAULT_HASH = int(TOTAL_MEM_MiB/4)
@@ -82,6 +84,10 @@ class XtEngProvider:
         self.http = requests.Session()
         self.http.headers["Authorization"] = f"Bearer {args.token}"
         self.secret = self.register_engine(args, self.http, self.engine)
+
+        retries = Retry(total=5, backoff_factor=0.2, status_forcelist=[500, 502, 503, 504])
+        self.http.mount('https://', HTTPAdapter(max_retries=retries))
+
 
     def register_engine(self, args, http, engine):
         res = ok(http.get(f"{args.lichess}/api/external-engine"))
@@ -238,7 +244,7 @@ class Engine:
         self.name = None
         self.cfg = cfg
         self.session_id = None
-        self.hash = None
+        self.hash = 64
         self.threads = None
         self.multi_pv = None
         self.uci_variant = None
@@ -251,10 +257,7 @@ class Engine:
         self.setoption("UCI_AnalyseMode", "true")
         self.setoption("UCI_Chess960", "true")
         self.setoption("UCI_ShowWDL", "false")
-        if hasattr(cfg, 'hash'):
-            self.setoption("Hash", cfg.hash)
-        else:
-            self.setoption("Hash", DEFAULT_HASH)
+        self.setoption("Hash", self.hash)
         if hasattr(cfg, 'threads'):
             self.setoption("Threads", cfg.threads)
         else:
@@ -359,11 +362,18 @@ class Engine:
             self.setoption("Threads", work["threads"])
             self.threads = work["threads"]
             options_changed = True
+
         # Lichess configurable Hash size 512 is too small
         # if self.hash != work["hash"]:
         #     self.setoption("Hash", work["hash"])
         #     self.hash = work["hash"]
         #     options_changed = True
+
+        running_hash = self.cfg.hash if hasattr(self.cfg, 'hash') else DEFAULT_HASH
+        if self.hash != running_hash:
+            self.setoption("Hash", running_hash)
+            self.hash = running_hash
+
         if self.multi_pv != work["multiPv"]:
             self.setoption("MultiPV", work["multiPv"])
             self.multi_pv = work["multiPv"]
