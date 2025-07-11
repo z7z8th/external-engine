@@ -13,6 +13,21 @@
             "hash": 32768,
             "threads": 12,
             "keep_alive": 300
+        },
+        {
+            "engine": "~/Chess/engines/ice4/ice4-ob",
+            "hash": 32768,
+            "threads": 12,
+            "keep_alive": 300
+        },
+        {
+            "engine":"~/Chess/engines/berserk/berserk"
+        },
+        {
+            "engine":"~/Chess/engines/PlentyChess/PlentyChess"
+        },
+        {
+            "engine":"~/Chess/engines/Obsidian/Obsidian"
         }
     ]
 }
