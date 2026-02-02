@@ -1,13 +1,13 @@
 {
     "engines": [
         {
-            "engine": "~/Chess/engines/lc0/bin/lc0-gpu",
+            "engine": "~/Chess/engines/lc0/bin/lc0-nv-gpu",
             "setoption": {
                 "UCI_ShowWDL": false
             }
         },
         {
-            "engine": "~/Chess/engines/stockfish/stockfish-ubuntu-x86-64-bmi2",
+            "engine": "~/Chess/engines/stockfish/stockfish",
             "max_hash": 48000,
             "max_threads": 24,
             "hash": 32768,

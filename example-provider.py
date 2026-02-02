@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 """External engine provider example for lichess.org"""
 
@@ -200,10 +200,17 @@ def main(args):
 
     if args.config:
         for cfg in args.config.engines:
-            p = XtEngProvider(args, cfg, executor)
-            providers[p.name] = p
+            try:
+                p = XtEngProvider(args, cfg, executor)
+                logging.info(f'Created engine {cfg}')
+                providers[p.name] = p
+            except Exception as e:
+                logging.error(f'Failed to create engine {cfg} {e!r}')
+                p = None
+                continue
+            
 
-    logging.info('providers %s', providers)
+    logging.info('providers %d %s', len(providers), providers)
     futures = {}
     pcnt = 0
     for pname, p in providers.items():
