@@ -64,7 +64,7 @@ class CustomFormatter(logging.Formatter):
 
 def ok(res):
     try:
-        print('Got HTTP res', res, 'res.text', res.text)
+        logging.debug('Got HTTP res', res, 'res.text', res.text)
         res.raise_for_status()
     except requests.exceptions.HTTPError as e:
         logging.exception('Got HTTP Error %s', res.text)
@@ -458,7 +458,7 @@ if __name__ == "__main__":
     rootLogger = logging.getLogger()
     rootLogger.setLevel(_LOG_LEVEL_MAP[args.log_level])
     ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
+    ch.setLevel(logging.INFO)
     ch.setFormatter(CustomFormatter())
     rootLogger.addHandler(ch)
 
